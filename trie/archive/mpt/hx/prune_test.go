@@ -1,0 +1,272 @@
+package hx
+
+import (
+	"fmt"
+	"sync/atomic"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/triedb/database"
+)
+
+type countingNodeDB struct {
+	*memNodeDB
+	reads atomic.Int64
+}
+
+type countingNodeReader struct {
+	database.NodeReader
+	reads *atomic.Int64
+}
+
+func (db *countingNodeDB) NodeReader(owner common.Hash) (database.NodeReader, error) {
+	r, err := db.memNodeDB.NodeReader(owner)
+	if err != nil {
+		return nil, err
+	}
+	return &countingNodeReader{NodeReader: r, reads: &db.reads}, nil
+}
+
+func (r *countingNodeReader) Node(owner common.Hash, path []byte, hash common.Hash) ([]byte, error) {
+	r.reads.Add(1)
+	return r.NodeReader.Node(owner, path, hash)
+}
+
+func pruneTestKey(domain, seq int) []byte {
+	key := make([]byte, 32)
+	key[0] = byte(domain) << 4
+	key[29] = byte(seq >> 8)
+	key[30] = byte(seq)
+	key[31] = byte(seq*7 + 3)
+	return key
+}
+
+func TestHXExtractDomainEpochSelective(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	tr.SetEpochPolicy(func(key []byte) byte {
+		if key[0]>>4 == 7 {
+			return 1
+		}
+		return key[30] & 1
+	})
+	want := make(map[string]string)
+	for i := 0; i < 64; i++ {
+		key := pruneTestKey(5, i)
+		val := []byte(fmt.Sprintf("d5-%d", i))
+		if err := tr.Update(key, val); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 1 {
+			want[string(key)] = string(val)
+		}
+	}
+	for i := 0; i < 32; i++ {
+		key := pruneTestKey(7, i)
+		val := []byte(fmt.Sprintf("d7-%d", i))
+		if err := tr.Update(key, val); err != nil {
+			t.Fatal(err)
+		}
+		want[string(key)] = string(val)
+	}
+
+	extracted, err := tr.ExtractDomain([]byte{5}, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extracted) != 32 {
+		t.Fatalf("extracted %d entries, want 32 (even-seq epoch-0 leaves)", len(extracted))
+	}
+	for _, e := range extracted {
+		if e.Key[0]>>4 != 5 {
+			t.Fatalf("extracted key outside domain: %x", e.Key)
+		}
+		if e.Key[30]&1 != 0 {
+			t.Fatalf("extracted fresh leaf %x (odd seq has epoch 1)", e.Key)
+		}
+	}
+	for i := 0; i < 64; i++ {
+		key := pruneTestKey(5, i)
+		val, err := tr.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 1 {
+			if string(val) != fmt.Sprintf("d5-%d", i) {
+				t.Fatalf("survivor %d: %q", i, val)
+			}
+		} else if val != nil {
+			t.Fatalf("evicted leaf %d still present", i)
+		}
+	}
+	if err := tr.VerifyAggregates(); err != nil {
+		t.Fatalf("aggregates after extract: %v", err)
+	}
+	tdb := newTestDB()
+	tdb.nodes = db.nodes
+	tdb.commit(t, tr)
+}
+
+func TestHXCanSkipSubtreeDoesNotTouch(t *testing.T) {
+	db := &countingNodeDB{memNodeDB: newTestDB()}
+	tr := NewEmpty(db)
+	tr.SetEpochPolicy(func(key []byte) byte { return 1 })
+	for i := 0; i < 64; i++ {
+		if err := tr.Update(pruneTestKey(3, i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 16; i++ {
+		if err := tr.Update(pruneTestKey(9, i), []byte(fmt.Sprintf("w%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, nodes := tr.Commit()
+	if nodes != nil {
+		for _, n := range nodes.Nodes {
+			if n.IsDeleted() {
+				delete(db.nodes, n.Hash)
+				continue
+			}
+			db.nodes[n.Hash] = n.Blob
+		}
+	}
+
+	db.reads.Store(0)
+	cold, err := New(root, common.Hash{}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extracted, err := cold.ExtractDomain([]byte{3}, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extracted) != 0 {
+		t.Fatalf("extracted %d fresh leaves, want 0", len(extracted))
+	}
+	navReads := db.reads.Load()
+	if navReads > 3 {
+		t.Fatalf("CanSkip violated: %d node reads for a fully-skipped domain, want <= 3", navReads)
+	}
+
+	db.reads.Store(0)
+	cold2, err := New(root, common.Hash{}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extracted, err = cold2.ExtractDomain([]byte{3}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extracted) != 64 {
+		t.Fatalf("extracted %d, want 64", len(extracted))
+	}
+	if db.reads.Load() <= navReads {
+		t.Fatalf("extraction read %d nodes, want strictly more than the %d navigation reads", db.reads.Load(), navReads)
+	}
+	if err := cold2.VerifyAggregates(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHXExtractDomainAbsent(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	out, err := tr.ExtractDomain([]byte{4}, 0, nil)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("empty trie: %d entries, err %v", len(out), err)
+	}
+	tr.Update(pruneTestKey(1, 1), []byte("x"))
+	out, err = tr.ExtractDomain([]byte{4}, 0, nil)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("absent domain: %d entries, err %v", len(out), err)
+	}
+	tr2 := NewEmpty(db)
+	tr2.SetEpochPolicy(func(key []byte) byte { return 0 })
+	only := pruneTestKey(4, 77)
+	tr2.Update(only, []byte("only"))
+	out, err = tr2.ExtractDomain([]byte{4}, 0, nil)
+	if err != nil || len(out) != 1 || string(out[0].Value) != "only" {
+		t.Fatalf("single-leaf domain extract: %d entries, err %v", len(out), err)
+	}
+	if val, _ := tr2.Get(only); val != nil {
+		t.Fatal("extracted leaf still present")
+	}
+}
+
+func TestHXExtractDomainBitFilter(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	tr.SetEpochPolicy(func(key []byte) byte { return 0 })
+	for i := 0; i < 16; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[1] = byte(i)
+		if err := tr.Update(key, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extracted, err := tr.ExtractDomain([]byte{2, 0, 0}, 0, func(key []byte) bool {
+		return key[1]&0x8 == 0
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extracted) != 8 {
+		t.Fatalf("extracted %d, want 8 (bit-12-clear half of the subtree)", len(extracted))
+	}
+	for _, e := range extracted {
+		if e.Key[1]&0x8 != 0 {
+			t.Fatalf("extracted out-of-domain key %x", e.Key)
+		}
+	}
+	for i := 0; i < 16; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[1] = byte(i)
+		val, err := tr.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 8 && val != nil {
+			t.Fatalf("in-domain leaf %d survived extraction", i)
+		}
+		if i >= 8 && string(val) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("out-of-domain leaf %d lost: %q", i, val)
+		}
+	}
+	if err := tr.VerifyAggregates(); err != nil {
+		t.Fatalf("aggregates after filtered extract: %v", err)
+	}
+}
+
+func TestHXCommitShortShortChainNoOversizedEmbed(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	val := valueNode(mkKey(42))
+	leaf := &shortNode{Key: []byte{4, 5, 6, 16}, Val: val, Epoch: 1, flags: tr.newFlag()}
+	inner := &shortNode{Key: []byte{2, 3}, Val: leaf, Epoch: 1, flags: tr.newFlag()}
+	outer := &shortNode{Key: []byte{1}, Val: inner, Epoch: 1, flags: tr.newFlag()}
+	tr.root = outer
+	tr.uncommitted = 3
+
+	root := db.commit(t, tr)
+
+	reopened, err := New(root, common.Hash{}, db)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	found := 0
+	if err := reopened.CollectLeaves(func(key, value []byte) bool {
+		found++
+		if string(value) != string(val) {
+			t.Fatalf("value mismatch: %x", value)
+		}
+		return true
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if found != 1 {
+		t.Fatalf("leaves = %d, want 1", found)
+	}
+}

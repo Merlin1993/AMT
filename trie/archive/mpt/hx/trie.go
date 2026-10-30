@@ -1,0 +1,665 @@
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public License as
+// published by the Free Software Foundation, version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package hx
+
+import (
+	"bytes"
+	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/trie/trienode"
+	"github.com/ethereum/go-ethereum/triedb/database"
+)
+
+// 热树沿用十六叉路径；写入更新叶子的时期位，普通读取不续期。
+type Trie struct {
+	root  node
+	owner common.Hash
+
+	committed   bool
+	unhashed    int
+	uncommitted int
+
+	reader *trieReader
+	tracer *tracer
+
+	resolvedNodes int64
+
+	leafDelta int64
+
+	epochPolicy func(key []byte) byte
+}
+
+func New(root common.Hash, owner common.Hash, db database.NodeDatabase) (*Trie, error) {
+	reader, err := newTrieReader(root, owner, db)
+	if err != nil {
+		return nil, err
+	}
+	trie := &Trie{
+		owner:  owner,
+		reader: reader,
+		tracer: newTracer(),
+	}
+	if root != (common.Hash{}) && root != types.EmptyRootHash {
+		rootnode, err := trie.resolveAndTrack(root[:], nil)
+		if err != nil {
+			return nil, err
+		}
+		trie.root = rootnode
+	}
+	return trie, nil
+}
+
+func NewEmpty(db database.NodeDatabase) *Trie {
+	tr, _ := New(types.EmptyRootHash, common.Hash{}, db)
+	return tr
+}
+
+func (t *Trie) SetEpochPolicy(fn func(key []byte) byte) {
+	t.epochPolicy = fn
+}
+
+func (t *Trie) epochFor(key []byte) byte {
+	if t.epochPolicy == nil {
+		return 0
+	}
+	return t.epochPolicy(key) & 1
+}
+
+func (t *Trie) newFlag() nodeFlag {
+	return nodeFlag{dirty: true}
+}
+
+func (t *Trie) Get(key []byte) ([]byte, error) {
+	if t.committed {
+		return nil, ErrCommitted
+	}
+	value, newroot, didResolve, err := t.get(t.root, keybytesToHex(key), 0)
+	if err == nil && didResolve {
+		t.root = newroot
+	}
+	return value, err
+}
+
+func (t *Trie) get(origNode node, key []byte, pos int) (value []byte, newnode node, didResolve bool, err error) {
+	switch n := (origNode).(type) {
+	case nil:
+		return nil, nil, false, nil
+	case valueNode:
+		return n, n, false, nil
+	case *shortNode:
+		if !bytes.HasPrefix(key[pos:], n.Key) {
+			return nil, n, false, nil
+		}
+		value, newnode, didResolve, err = t.get(n.Val, key, pos+len(n.Key))
+		if err == nil && didResolve {
+			n = n.copy()
+			n.Val = newnode
+		}
+		return value, n, didResolve, err
+	case *fullNode:
+		value, newnode, didResolve, err = t.get(n.Children[key[pos]], key, pos+1)
+		if err == nil && didResolve {
+			n = n.copy()
+			n.Children[key[pos]] = newnode
+		}
+		return value, n, didResolve, err
+	case hashNode:
+		child, err := t.resolveAndTrack(n, key[:pos])
+		if err != nil {
+			return nil, n, true, err
+		}
+		value, newnode, _, err := t.get(child, key, pos)
+		return value, newnode, true, err
+	default:
+		panic("hx: invalid node type")
+	}
+}
+
+func (t *Trie) Update(key, value []byte) error {
+	if t.committed {
+		return ErrCommitted
+	}
+	t.unhashed++
+	t.uncommitted++
+	k := keybytesToHex(key)
+	if len(value) != 0 {
+		epoch := t.epochFor(key)
+		_, n, err := t.insert(t.root, nil, k, valueNode(value), epoch)
+		if err != nil {
+			return err
+		}
+		t.root = n
+	} else {
+		_, n, err := t.delete(t.root, nil, k)
+		if err != nil {
+			return err
+		}
+		t.root = n
+	}
+	return nil
+}
+
+func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool, node, error) {
+	if len(key) == 0 {
+		if v, ok := n.(valueNode); ok {
+			return !bytes.Equal(v, value.(valueNode)), value, nil
+		}
+		return true, value, nil
+	}
+	switch n := n.(type) {
+	case *shortNode:
+		matchlen := prefixLen(key, n.Key)
+		if matchlen == len(n.Key) {
+			dirty, nn, err := t.insert(n.Val, append(prefix, key[:matchlen]...), key[matchlen:], value, epoch)
+			if err != nil {
+				return false, n, err
+			}
+			if !dirty {
+				if _, isVal := n.Val.(valueNode); isVal && n.Epoch != epoch {
+					return true, &shortNode{Key: n.Key, Val: n.Val, Epoch: epoch, Stubs: n.Stubs, flags: t.newFlag()}, nil
+				}
+				return false, n, nil
+			}
+			fresh := &shortNode{Key: n.Key, Val: nn, Stubs: n.Stubs, flags: t.newFlag()}
+			if _, isVal := nn.(valueNode); isVal {
+				fresh.Epoch = epoch
+			} else {
+				fresh.Agg = subtreeAggOf(nn)
+			}
+			return true, fresh, nil
+		}
+		branch := &fullNode{flags: t.newFlag()}
+		var err error
+		oldSuffix := n.Key[matchlen+1:]
+		if len(oldSuffix) == 0 {
+			branch.Children[n.Key[matchlen]] = n.Val
+		} else {
+			t.tracer.onInsert(append(prefix, n.Key[:matchlen+1]...))
+			branch.Children[n.Key[matchlen]] = &shortNode{Key: oldSuffix, Val: n.Val, Epoch: n.Epoch, Agg: n.Agg, flags: t.newFlag()}
+		}
+		_, branch.Children[key[matchlen]], err = t.insert(nil, append(prefix, key[:matchlen+1]...), key[matchlen+1:], value, epoch)
+		if err != nil {
+			return false, nil, err
+		}
+		branch.refreshAgg(int(n.Key[matchlen]))
+		branch.refreshAgg(int(key[matchlen]))
+		if matchlen == 0 {
+			branch.Stubs = n.Stubs
+			return true, branch, nil
+		}
+		t.tracer.onInsert(append(prefix, key[:matchlen]...))
+		ext := &shortNode{Key: key[:matchlen], Val: branch, Stubs: n.Stubs, flags: t.newFlag()}
+		ext.Agg = subtreeAggOf(branch)
+		return true, ext, nil
+
+	case *fullNode:
+		dirty, nn, err := t.insert(n.Children[key[0]], append(prefix, key[0]), key[1:], value, epoch)
+		if !dirty || err != nil {
+			return false, n, err
+		}
+		n = n.copy()
+		n.flags = t.newFlag()
+		n.Children[key[0]] = nn
+		n.refreshAgg(int(key[0]))
+		return true, n, nil
+
+	case nil:
+		t.tracer.onInsert(prefix)
+		t.leafDelta++
+		return true, &shortNode{Key: key, Val: value, Epoch: epoch, flags: t.newFlag()}, nil
+
+	case hashNode:
+		rn, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return false, nil, err
+		}
+		dirty, nn, err := t.insert(rn, prefix, key, value, epoch)
+		if !dirty || err != nil {
+			return false, rn, err
+		}
+		return true, nn, nil
+
+	default:
+		panic("hx: invalid node type")
+	}
+}
+
+func (t *Trie) Delete(key []byte) error {
+	if t.committed {
+		return ErrCommitted
+	}
+	t.uncommitted++
+	t.unhashed++
+	k := keybytesToHex(key)
+	_, n, err := t.delete(t.root, nil, k)
+	if err != nil {
+		return err
+	}
+	t.root = n
+	return nil
+}
+
+func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
+	switch n := n.(type) {
+	case *shortNode:
+		matchlen := prefixLen(key, n.Key)
+		if matchlen < len(n.Key) {
+			return false, n, nil
+		}
+		if matchlen == len(key) {
+			t.tracer.onDelete(prefix)
+			t.leafDelta--
+			return true, nil, nil
+		}
+		dirty, child, err := t.delete(n.Val, append(prefix, key[:len(n.Key)]...), key[len(n.Key):])
+		if !dirty || err != nil {
+			return false, n, err
+		}
+		switch child := child.(type) {
+		case *shortNode:
+			if _, isVal := child.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+				fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
+				fresh.Agg = subtreeAggOf(child)
+				return true, fresh, nil
+			}
+			t.tracer.onDelete(append(prefix, n.Key...))
+			merged := &shortNode{Key: concat(n.Key, child.Key...), Val: child.Val, Epoch: child.Epoch, Agg: child.Agg, Stubs: mergeStubs(n.Stubs, child.Stubs), flags: t.newFlag()}
+			return true, merged, nil
+		default:
+			fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
+			fresh.Agg = subtreeAggOf(child)
+			return true, fresh, nil
+		}
+
+	case *fullNode:
+		dirty, nn, err := t.delete(n.Children[key[0]], append(prefix, key[0]), key[1:])
+		if !dirty || err != nil {
+			return false, n, err
+		}
+		n = n.copy()
+		n.flags = t.newFlag()
+		n.Children[key[0]] = nn
+
+		if nn != nil {
+			n.refreshAgg(int(key[0]))
+			return true, n, nil
+		}
+		n.setAgg(int(key[0]), aggEmpty)
+		pos := -1
+		for i, cld := range &n.Children {
+			if cld != nil {
+				if pos == -1 {
+					pos = i
+				} else {
+					pos = -2
+					break
+				}
+			}
+		}
+		if pos >= 0 {
+			if pos != 16 {
+				cnode, err := t.resolve(n.Children[pos], append(prefix, byte(pos)))
+				if err != nil {
+					return false, nil, err
+				}
+				if cnode, ok := cnode.(*shortNode); ok {
+					if _, isVal := cnode.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+						fresh := &shortNode{Key: []byte{byte(pos)}, Val: cnode, Stubs: n.Stubs, flags: t.newFlag()}
+						fresh.Agg = subtreeAggOf(cnode)
+						return true, fresh, nil
+					}
+					t.tracer.onDelete(append(prefix, byte(pos)))
+					k := append([]byte{byte(pos)}, cnode.Key...)
+					return true, &shortNode{Key: k, Val: cnode.Val, Epoch: cnode.Epoch, Agg: cnode.Agg, Stubs: mergeStubs(n.Stubs, cnode.Stubs), flags: t.newFlag()}, nil
+				}
+				fresh := &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], Stubs: n.Stubs, flags: t.newFlag()}
+				fresh.Agg = n.getAgg(pos)
+				return true, fresh, nil
+			}
+			return true, &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], Stubs: n.Stubs, flags: t.newFlag()}, nil
+		}
+		return true, n, nil
+
+	case valueNode:
+		return true, nil, nil
+
+	case nil:
+		return false, nil, nil
+
+	case hashNode:
+		rn, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return false, nil, err
+		}
+		dirty, nn, err := t.delete(rn, prefix, key)
+		if !dirty || err != nil {
+			return false, rn, err
+		}
+		return true, nn, nil
+
+	default:
+		panic("hx: invalid node type")
+	}
+}
+
+func concat(s1 []byte, s2 ...byte) []byte {
+	r := make([]byte, len(s1)+len(s2))
+	copy(r, s1)
+	copy(r[len(s1):], s2)
+	return r
+}
+
+func (t *Trie) resolve(n node, prefix []byte) (node, error) {
+	if n, ok := n.(hashNode); ok {
+		return t.resolveAndTrack(n, prefix)
+	}
+	return n, nil
+}
+
+func (t *Trie) resolveAndTrack(n hashNode, prefix []byte) (node, error) {
+	blob, err := t.reader.node(prefix, common.BytesToHash(n))
+	if err != nil {
+		return nil, err
+	}
+	t.tracer.onRead(prefix, blob)
+	decoded, err := decodeNode(n, blob)
+	if err != nil {
+		return nil, err
+	}
+	t.resolvedNodes++
+	return decoded, nil
+}
+
+func (t *Trie) ResolvedNodes() int64 { return t.resolvedNodes }
+
+func (t *Trie) LeafDelta() int64 {
+	d := t.leafDelta
+	t.leafDelta = 0
+	return d
+}
+
+func (t *Trie) PrefetchPrefix(prefix []byte, budget int) (visited int) {
+	if budget <= 0 || t.root == nil {
+		return 0
+	}
+	n := t.root
+	pos := 0
+	for pos < len(prefix) {
+		switch node := n.(type) {
+		case *shortNode:
+			if len(prefix)-pos < len(node.Key) || !bytes.Equal(node.Key, prefix[pos:pos+len(node.Key)]) {
+				return visited
+			}
+			pos += len(node.Key)
+			n = node.Val
+		case *fullNode:
+			child := node.Children[prefix[pos]]
+			pos++
+			if child == nil {
+				return visited
+			}
+			n = child
+		case hashNode:
+			resolved, err := t.resolveAndTrack(node, prefix[:pos])
+			if err != nil {
+				return visited
+			}
+			visited++
+			n = resolved
+		default:
+			return visited
+		}
+		if visited >= budget {
+			return visited
+		}
+	}
+	if hn, ok := n.(hashNode); ok {
+		resolved, err := t.resolveAndTrack(hn, prefix)
+		if err != nil {
+			return visited
+		}
+		visited++
+		n = resolved
+	}
+	t.prefetchWalk(n, prefix, budget, &visited)
+	return visited
+}
+
+func (t *Trie) prefetchWalk(n node, prefix []byte, budget int, visited *int) {
+	if *visited >= budget {
+		return
+	}
+	switch node := n.(type) {
+	case *shortNode:
+		if hn, ok := node.Val.(hashNode); ok {
+			resolved, err := t.resolveAndTrack(hn, append(prefix, node.Key...))
+			if err != nil {
+				*visited = budget
+				return
+			}
+			*visited++
+			t.prefetchWalk(resolved, append(prefix, node.Key...), budget, visited)
+			return
+		}
+		t.prefetchWalk(node.Val, append(prefix, node.Key...), budget, visited)
+	case *fullNode:
+		for i := 0; i < 16 && *visited < budget; i++ {
+			child := node.Children[i]
+			if child == nil {
+				continue
+			}
+			childPrefix := append(prefix, byte(i))
+			if hn, ok := child.(hashNode); ok {
+				resolved, err := t.resolveAndTrack(hn, childPrefix)
+				if err != nil {
+					*visited = budget
+					return
+				}
+				*visited++
+				t.prefetchWalk(resolved, childPrefix, budget, visited)
+			} else {
+				t.prefetchWalk(child, childPrefix, budget, visited)
+			}
+		}
+	}
+}
+
+func (t *Trie) Hash() common.Hash {
+	hash, cached := t.hashRoot()
+	t.root = cached
+	return common.BytesToHash(hash.(hashNode))
+}
+
+func (t *Trie) Commit() (common.Hash, *trienode.NodeSet) {
+	defer func() {
+		t.committed = true
+	}()
+	if t.root == nil {
+		paths := t.tracer.deletedNodes()
+		if len(paths) == 0 {
+			return types.EmptyRootHash, nil
+		}
+		nodes := trienode.NewNodeSet(t.owner)
+		for _, path := range paths {
+			nodes.AddNode([]byte(path), trienode.NewDeleted())
+		}
+		return types.EmptyRootHash, nodes
+	}
+	rootHash := t.Hash()
+	if hashedNode, dirty := t.root.cache(); !dirty {
+		t.root = hashedNode
+		return rootHash, nil
+	}
+	nodes := trienode.NewNodeSet(t.owner)
+	for _, path := range t.tracer.deletedNodes() {
+		nodes.AddNode([]byte(path), trienode.NewDeleted())
+	}
+	t.root = newCommitter(nodes, t.tracer).Commit(t.root, t.uncommitted > 100)
+	t.uncommitted = 0
+	return rootHash, nodes
+}
+
+func (t *Trie) hashRoot() (node, node) {
+	if t.root == nil {
+		return hashNode(types.EmptyRootHash.Bytes()), nil
+	}
+	h := newHasher(t.unhashed >= 100)
+	defer func() {
+		returnHasherToPool(h)
+		t.unhashed = 0
+	}()
+	hashed, cached := h.hash(t.root, true)
+	return hashed, cached
+}
+
+func (t *Trie) LeafEpoch(key []byte) (byte, bool, error) {
+	if t.committed {
+		return 0, false, ErrCommitted
+	}
+	n := t.root
+	pos := 0
+	hexKey := keybytesToHex(key)
+	for {
+		switch nn := n.(type) {
+		case nil:
+			return 0, false, nil
+		case *shortNode:
+			if !bytes.HasPrefix(hexKey[pos:], nn.Key) {
+				return 0, false, nil
+			}
+			pos += len(nn.Key)
+			if _, ok := nn.Val.(valueNode); ok {
+				return nn.Epoch, true, nil
+			}
+			n = nn.Val
+		case *fullNode:
+			n = nn.Children[hexKey[pos]]
+			pos++
+		case hashNode:
+			resolved, err := t.resolveAndTrack(nn, hexKey[:pos])
+			if err != nil {
+				return 0, false, err
+			}
+			n = resolved
+		case valueNode:
+			return 0, false, nil
+		default:
+			panic("hx: invalid node type")
+		}
+	}
+}
+
+func (t *Trie) VerifyAggregates() error {
+	if t.committed {
+		return ErrCommitted
+	}
+	_, err := t.verifyNode(t.root, nil)
+	return err
+}
+
+func (t *Trie) verifyNode(n node, prefix []byte) (uint8, error) {
+	switch n := n.(type) {
+	case nil:
+		return aggEmpty, nil
+	case valueNode:
+		return aggEmpty, nil
+	case *shortNode:
+		if _, isVal := n.Val.(valueNode); isVal {
+			return epochToAgg(n.Epoch), nil
+		}
+		childAgg, err := t.verifyNode(n.Val, concat(prefix, n.Key...))
+		if err != nil {
+			return aggEmpty, err
+		}
+		if n.Agg != childAgg {
+			return aggEmpty, fmt.Errorf("hx: ext at %x agg %d, subtree %d", prefix, n.Agg, childAgg)
+		}
+		return n.Agg, nil
+	case *fullNode:
+		agg, seen := uint8(0), false
+		for i := 0; i < 16; i++ {
+			childAgg, err := t.verifyNode(n.Children[i], concat(prefix, byte(i)))
+			if err != nil {
+				return aggEmpty, err
+			}
+			if got := n.getAgg(i); got != childAgg {
+				return aggEmpty, fmt.Errorf("hx: branch at %x slot %d agg %d, subtree %d", prefix, i, got, childAgg)
+			}
+			agg, seen = combineAgg(agg, seen, childAgg)
+		}
+		if !seen {
+			return aggEmpty, nil
+		}
+		return agg, nil
+	case hashNode:
+		resolved, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return aggEmpty, err
+		}
+		return t.verifyNode(resolved, prefix)
+	default:
+		return aggEmpty, fmt.Errorf("hx: verifyNode on %T", n)
+	}
+}
+
+func (t *Trie) CollectLeaves(fn func(key, value []byte) bool) error {
+	if t.committed {
+		return ErrCommitted
+	}
+	_, err := t.collect(t.root, nil, fn)
+	return err
+}
+
+func (t *Trie) collect(n node, prefix []byte, fn func(key, value []byte) bool) (bool, error) {
+	switch n := n.(type) {
+	case nil:
+		return true, nil
+	case *shortNode:
+		if val, ok := n.Val.(valueNode); ok {
+			full := concat(prefix, n.Key...)
+			return fn(hexToKeybytes(full), val), nil
+		}
+		return t.collect(n.Val, concat(prefix, n.Key...), fn)
+	case *fullNode:
+		for i := 0; i < 16; i++ {
+			if n.Children[i] == nil {
+				continue
+			}
+			cont, err := t.collect(n.Children[i], concat(prefix, byte(i)), fn)
+			if err != nil || !cont {
+				return cont, err
+			}
+		}
+		if val, ok := n.Children[16].(valueNode); ok {
+			full := concat(prefix, 16)
+			return fn(hexToKeybytes(full), val), nil
+		}
+		return true, nil
+	case hashNode:
+		resolved, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return false, err
+		}
+		return t.collect(resolved, prefix, fn)
+	case valueNode:
+		return fn(hexToKeybytes(concat(prefix, 16)), n), nil
+	default:
+		panic("hx: invalid node type")
+	}
+}

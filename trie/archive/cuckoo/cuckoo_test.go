@@ -1,0 +1,192 @@
+package cuckoo
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"testing"
+)
+
+func TestFailedInsertPreservesFilter(t *testing.T) {
+	f := New(2, 2)
+	for i := 0; i < 4; i++ {
+		if err := f.Insert([]byte(fmt.Sprintf("rollback-1-%d", i))); err != nil {
+			t.Fatalf("seed insert %d: %v", i, err)
+		}
+	}
+	before := f.Encode()
+	if err := f.Insert([]byte("rollback-1-extra")); err != ErrFull {
+		t.Fatalf("full filter insert returned %v, want ErrFull", err)
+	}
+	if after := f.Encode(); !bytes.Equal(after, before) {
+		t.Fatalf("failed insert changed filter: before %x, after %x", before, after)
+	}
+}
+
+func TestDecodeUsesEncodedDimensionsAndRejectsMalformed(t *testing.T) {
+	original := New(2, 3)
+	if err := original.Insert([]byte("item")); err != nil {
+		t.Fatal(err)
+	}
+	encoded := original.Encode()
+	decoded := New(32, 4)
+	if err := decoded.Decode(encoded, 32, 4); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded.Encode(), encoded) || !decoded.Lookup([]byte("item")) {
+		t.Fatal("decoded filter did not retain its encoded layout and entry")
+	}
+
+	badBuckets := bytes.Clone(encoded)
+	binary.BigEndian.PutUint32(badBuckets[:4], 3)
+	badSlots := bytes.Clone(encoded)
+	binary.BigEndian.PutUint32(badSlots[4:8], 0)
+	badPadding := bytes.Clone(encoded)
+	badPadding[8] |= 1
+	zeroFingerprint := bytes.Clone(encoded)
+	clear(zeroFingerprint[len(zeroFingerprint)-2:])
+	malformed := [][]byte{
+		encoded[:len(encoded)-1],
+		append(bytes.Clone(encoded), 0),
+		badBuckets,
+		badSlots,
+		badPadding,
+		zeroFingerprint,
+	}
+	for i, data := range malformed {
+		if err := decoded.Decode(data, 0, 0); err == nil {
+			t.Fatalf("malformed filter %d decoded successfully", i)
+		}
+		if !bytes.Equal(decoded.Encode(), encoded) {
+			t.Fatalf("malformed filter %d changed the receiver", i)
+		}
+	}
+}
+
+func TestFilterBasic(t *testing.T) {
+	f := New(32, 4)
+	data := []byte("hello")
+
+	if f.Lookup(data) {
+		t.Fatal("未插入的数据查询结果应为 false")
+	}
+
+	if err := f.Insert(data); err != nil {
+		t.Fatalf("插入失败: %v", err)
+	}
+
+	if !f.Lookup(data) {
+		t.Fatal("插入的数据查询结果应为 true")
+	}
+
+	if !f.Delete(data) {
+		t.Fatal("删除已存在的数据应返回 true")
+	}
+
+	if f.Lookup(data) {
+		t.Fatal("删除后的数据查询结果应为 false")
+	}
+}
+
+func TestFilterCapacity(t *testing.T) {
+	f := New(32, 4)
+	count := 0
+	for i := 0; i < 100; i++ {
+		data := []byte(fmt.Sprintf("data-%d", i))
+		if err := f.Insert(data); err != nil {
+			t.Logf("在存满前共插入了 %d 个元素", i)
+			break
+		}
+		count++
+	}
+
+	if count < 80 {
+		t.Fatalf("过滤器应至少支持 80 个元素，但仅支持 %d 个", count)
+	}
+
+	for i := 0; i < count; i++ {
+		data := []byte(fmt.Sprintf("data-%d", i))
+		if !f.Lookup(data) {
+			t.Fatalf("查询已插入元素 %d 失败", i)
+		}
+	}
+}
+
+func TestFalsePositiveRate(t *testing.T) {
+	f := New(32, 4)
+	numInserted := 100
+	for i := 0; i < numInserted; i++ {
+		data := []byte(fmt.Sprintf("data-%d", i))
+		_ = f.Insert(data)
+	}
+
+	fpCount := 0
+	numTested := 10000
+	for i := 0; i < numTested; i++ {
+		data := []byte(fmt.Sprintf("test-%d", i))
+		if f.Lookup(data) {
+			fpCount++
+		}
+	}
+
+	fpRate := float64(fpCount) / float64(numTested)
+	t.Logf("假阳性次数: %d, 概率: %f", fpCount, fpRate)
+
+	if fpRate > 0.001 {
+		t.Fatalf("假阳性率过高: %f (预期 < 0.001)", fpRate)
+	}
+}
+
+func TestReset(t *testing.T) {
+	f := New(32, 4)
+	f.Insert([]byte("a"))
+	f.Insert([]byte("b"))
+	f.Reset()
+
+	if f.Count() != 0 {
+		t.Fatal("重置后计数应为 0")
+	}
+	if f.Lookup([]byte("a")) || f.Lookup([]byte("b")) {
+		t.Fatal("重置后查询应返回 false")
+	}
+}
+
+func TestEncodeDecode(t *testing.T) {
+	f1 := New(32, 4)
+	elements := []string{"apple", "banana", "cherry", "date"}
+	for _, el := range elements {
+		f1.Insert([]byte(el))
+	}
+
+	data := f1.Encode()
+	expectedSize := 8 + 16 + len(elements)*2
+	if len(data) != expectedSize {
+		t.Fatalf("编码后的数据长度应为 %d, 实际为 %d", expectedSize, len(data))
+	}
+
+	f2 := New(32, 4)
+	if err := f2.Decode(data, 0, 0); err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+
+	if f2.Count() != f1.Count() {
+		t.Fatalf("计数不匹配: 实际 %d, 预期 %d", f2.Count(), f1.Count())
+	}
+
+	for _, el := range elements {
+		if !f2.Lookup([]byte(el)) {
+			t.Errorf("解码后的过滤器查询元素 %s 失败", el)
+		}
+	}
+
+	if f2.Lookup([]byte("grape")) {
+		t.Error("未插入元素的查询结果应为 false")
+	}
+
+	// 测试空过滤器编码
+	f3 := New(32, 4)
+	emptyData := f3.Encode()
+	if len(emptyData) != 24 {
+		t.Fatalf("空过滤器的编码长度应为 24, 实际为 %d", len(emptyData))
+	}
+}
