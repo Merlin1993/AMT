@@ -3,11 +3,55 @@
   "first_block": 9046147,
   "last_block": 9047452,
   "rows": 4687270,
-  "compressed_bytes": 100083833,
+  "compressed_bytes": 100081752,
   "shards": [
-    {"file": "state_access_trace_009046147_009046472.csv.gz", "first_block": 9046147, "last_block": 9046472, "rows": 883474, "compressed_bytes": 18522047, "sha256": "802639829e1ef199c08d675adb00905c0d5856248e77dcb5f599d96b7f00a6f7"},
-    {"file": "state_access_trace_009046473_009046798.csv.gz", "first_block": 9046473, "last_block": 9046798, "rows": 1188488, "compressed_bytes": 24116767, "sha256": "f1d682aaf68f89a7eff3d5a6fb0eef93222af6b50f318c8f483a9e52abbfd3d5"},
-    {"file": "state_access_trace_009046799_009047124.csv.gz", "first_block": 9046799, "last_block": 9047124, "rows": 1361007, "compressed_bytes": 30134387, "sha256": "03ad44f259f1df12cf824463c7258debc604b2cece0f58bcd64b0e5ef3fd9b3f"},
-    {"file": "state_access_trace_009047125_009047452.csv.gz", "first_block": 9047125, "last_block": 9047452, "rows": 1254301, "compressed_bytes": 27310632, "sha256": "2270a7e18682012ad8777b4fb8458d187128f6dc18bb7993637d4615339b674e"}
+    {
+      "file": "state_access_trace_009046147_009046472.csv.gz",
+      "first_block": 9046147,
+      "last_block": 9046472,
+      "rows": 883474,
+      "compressed_bytes": 18522047,
+      "sha256": "802639829e1ef199c08d675adb00905c0d5856248e77dcb5f599d96b7f00a6f7"
+    },
+    {
+      "file": "state_access_trace_009046473_009046798.csv.gz",
+      "first_block": 9046473,
+      "last_block": 9046798,
+      "rows": 1188488,
+      "compressed_bytes": 24116767,
+      "sha256": "f1d682aaf68f89a7eff3d5a6fb0eef93222af6b50f318c8f483a9e52abbfd3d5"
+    },
+    {
+      "file": "state_access_trace_009046799_009046961.csv.gz",
+      "first_block": 9046799,
+      "last_block": 9046961,
+      "rows": 645354,
+      "compressed_bytes": 14283703,
+      "sha256": "821e494349bb220f7f92750a9c82e9345f6ec4c38dfa30834850f0f7c8f97ca1"
+    },
+    {
+      "file": "state_access_trace_009046962_009047124.csv.gz",
+      "first_block": 9046962,
+      "last_block": 9047124,
+      "rows": 715653,
+      "compressed_bytes": 15851861,
+      "sha256": "c5c91ef49d2ba6abb554e021926861c6f375bad3a8d59889b33442bb85c9e298"
+    },
+    {
+      "file": "state_access_trace_009047125_009047288.csv.gz",
+      "first_block": 9047125,
+      "last_block": 9047288,
+      "rows": 634555,
+      "compressed_bytes": 13760209,
+      "sha256": "169defbd8f5b621c09437d5920216ca4abd2cee16385faf2dace5fbbd95a163a"
+    },
+    {
+      "file": "state_access_trace_009047289_009047452.csv.gz",
+      "first_block": 9047289,
+      "last_block": 9047452,
+      "rows": 619746,
+      "compressed_bytes": 13547165,
+      "sha256": "b947f7d191ae348170ddcd897d5db852b6e9641dcf6ce63bfd0dad37770079af"
+    }
   ]
 }

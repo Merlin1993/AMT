@@ -12,7 +12,7 @@ This repository contains the AMT implementation, the ordered Ethereum state-acce
 
 ## Bundled trace sample
 
-`trie/archive/testdata/trace_sample_100mb` contains four compressed, ordered trace shards totaling 100,083,833 bytes and 4,687,270 records from blocks 9,046,147–9,047,452. Each shard ends at a block boundary. Its `manifest.json` records their SHA-256 checksums and ranges.
+`trie/archive/testdata/trace_sample_100mb` contains six compressed, ordered trace shards totaling 100,081,752 bytes and 4,687,270 records from blocks 9,046,147–9,047,452. Each shard ends at a block boundary. Its `manifest.json` records their SHA-256 checksums and ranges.
 
 The sample can check the real trace input and a short replay. It is too short to complete an archive round with the paper's full-replay settings. The full mainnet transaction dataset and trace corpus are external.
 
